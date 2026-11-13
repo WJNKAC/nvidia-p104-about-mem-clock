@@ -1,0 +1,23 @@
+CC      ?= cc
+CFLAGS  ?= -O2 -Wall -Wextra -std=gnu11
+TARGET   = p104-set-mem-clock
+SRC      = p104-set-mem-clock.c
+
+all: $(TARGET)
+
+$(TARGET): $(SRC)
+	$(CC) $(CFLAGS) -o $@ $<
+	@echo
+	@echo "构建完成: $(CURDIR)/$(TARGET)"
+	@echo "  sudo ./$(TARGET) --probe       # 只验证通道"
+	@echo "  sudo ./$(TARGET)               # acquire 后常驻"
+
+# 打印关键结构体尺寸，便于和 UAPI 对照
+sizes: sizes.c $(SRC)
+	$(CC) -O0 -w -I. -o sizes sizes.c
+	./sizes
+
+clean:
+	rm -f $(TARGET) sizes
+
+.PHONY: all clean sizes

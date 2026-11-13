@@ -1,0 +1,48 @@
+#include <linux/module.h>
+#include <linux/export-internal.h>
+#include <linux/compiler.h>
+
+MODULE_INFO(name, KBUILD_MODNAME);
+
+__visible struct module __this_module
+__section(".gnu.linkonce.this_module") = {
+	.name = KBUILD_MODNAME,
+	.init = init_module,
+#ifdef CONFIG_MODULE_UNLOAD
+	.exit = cleanup_module,
+#endif
+	.arch = MODULE_ARCH_INIT,
+};
+
+
+
+static const struct modversion_info ____versions[]
+__used __section("__versions") = {
+	{ 0xe783e261, "sysfs_emit" },
+	{ 0x8c8569cb, "kstrtoint" },
+	{ 0x7f02188f, "__msecs_to_jiffies" },
+	{ 0xc38c83b8, "mod_timer" },
+	{ 0x82ee90dc, "timer_delete_sync" },
+	{ 0x5b5bbd31, "sysfs_remove_group" },
+	{ 0x4ff94438, "param_ops_int" },
+	{ 0xbdfb6dbb, "__fentry__" },
+	{ 0x5b8239ca, "__x86_return_thunk" },
+	{ 0x15ba50a6, "jiffies" },
+	{ 0xceb38aab, "register_kretprobe" },
+	{ 0x92997ed8, "_printk" },
+	{ 0x5abebffa, "kernel_kobj" },
+	{ 0x47a82b63, "kobject_create_and_add" },
+	{ 0x35273366, "unregister_kretprobe" },
+	{ 0xc0dc64e6, "sysfs_create_group" },
+	{ 0x9acc1e61, "kobject_put" },
+	{ 0xc6f46339, "init_timer_key" },
+	{ 0x24d273d1, "add_timer" },
+	{ 0x5c3c7387, "kstrtoull" },
+	{ 0xf0fdf6cb, "__stack_chk_fail" },
+	{ 0x2f9b2b9a, "module_layout" },
+};
+
+MODULE_INFO(depends, "");
+
+
+MODULE_INFO(srcversion, "C20B79F24C4C13DAD7F1789");

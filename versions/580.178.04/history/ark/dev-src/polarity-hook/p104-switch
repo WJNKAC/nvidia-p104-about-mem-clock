@@ -1,0 +1,366 @@
+#!/bin/bash
+#
+# p104-switch —— P104-100 显存频率手动开关（405 ⇄ 5005）
+#
+# ── 原理（2026-11-13 实测确定，报告 237）─────────────────────────
+#
+# 405 不是硬件限制，是 RM 在 PERFMON_ENABLED=1 期间施加的「时钟锁定」：
+#   PMU 要计数准确，前提是时钟稳定；MCLK 一变，计数器读数就没法换算回时间。
+# 所以这是纯软件行为 —— 关掉 perfmon 锁就解除了。
+#
+# 这就是为什么一行 `MaxPerfWithPerfMon=0` 配置就能满速：
+#   它只做了一件事：清掉 PERFMON_ENABLED（pPerf+0x8e100 的 bit0）。
+#
+# 证据（A/B 唯一变量 = bit0）：
+#   bit0=1 → 405 MHz / 19.3 GB/s
+#   bit0=0 → 5005 MHz / 254.5 GB/s
+#   而两组 range 与 curValueToSet 完全相同（都 [5005,5005] / c5005000）
+#   ⇒ 改 curValueToSet 是无效方向，开关只在 bit0 上。
+#
+# ── 这个脚本做什么 ───────────────────────────────────────────────
+#
+#   on    清 bit0     → MCLK 5005（代价：空闲也 ~69W，且 util/pstate 读数失效）
+#   off   置回 bit0   → 回到 P8/139/405/7.9W（**要走恢复流程，不能直接 rmmod**）
+#   status
+#
+# ⚠ 为什么 off 不能直接 rmmod（真实事故）：
+#   直接 rmmod 后实测 GPU 常驻 P0/5005/70W 达 90 秒不回落，
+#   `nvidia-smi --gpu-reset` 也因 X server 占用而失败。
+#   必须：置回 bit0 → 触发一次 changeseq → 确认回 405 → 才考虑卸载。
+#
+# ── 用法 ─────────────────────────────────────────────────────────
+#
+#   p104-switch on        切到 5005
+#   p104-switch off       切回 405（安全恢复）
+#   p104-switch status
+#   p104-switch unload    off + 卸载模块（完整收摊）
+#
+# 不需要写 sudo（脚本自己递归提权）。
+# 不碰 /usr /etc /var，不写 systemd / modules-load.d —— 开机不会自动加载。
+
+set -u
+
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+HERE=$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)
+
+# 产物目录：$P104_HOME → 脚本同目录 → ~/.local/share/mclk-p104
+resolve_artdir() {
+    if [ -n "${P104_HOME:-}" ] && [ -d "$P104_HOME" ]; then echo "$P104_HOME"; return; fi
+    if [ -f "$HERE/polarity_hook.ko" ]; then echo "$HERE"; return; fi
+    if [ -n "${HOME:-}" ] && [ -d "$HOME/.local/share/mclk-p104" ]; then
+        echo "$HOME/.local/share/mclk-p104"; return; fi
+    echo "$HERE"
+}
+ARTDIR=$(resolve_artdir)
+
+KO="$ARTDIR/polarity_hook.ko"
+SYS=/sys/kernel/p104_polarity
+MOD=polarity_hook
+TARGET_NAME=${P104_TARGET_NAME:-P104}
+
+RED=''; GRN=''; YLW=''; RST=''
+if [ -t 1 ]; then RED=$'\033[31m'; GRN=$'\033[32m'; YLW=$'\033[33m'; RST=$'\033[0m'; fi
+ok()   { printf "  ${GRN}✓${RST} %s\n" "$*"; }
+bad()  { printf "  ${RED}✗${RST} %s\n" "$*"; }
+warn() { printf "  ${YLW}!${RST} %s\n" "$*"; }
+inf()  { printf "    %s\n" "$*"; }
+
+# ── 提权 ─────────────────────────────────────────────────────────
+need_root() {
+    [ "$(id -u)" -eq 0 ] && return 0
+    if [ "${P104_NO_SUDO:-0}" = "1" ]; then
+        bad "需要 root（P104_NO_SUDO=1 已禁止提权）"; exit 1
+    fi
+    command -v sudo >/dev/null 2>&1 || { bad "需要 root，但没有 sudo"; exit 1; }
+    echo "（需要 root，正在提权重入…）"
+    exec sudo -E env P104_NO_SUDO=0 P104_HOME="$ARTDIR" \
+         P104_TARGET_NAME="$TARGET_NAME" "$SELF" "$@"
+}
+
+# ── 显卡身份校验 ─────────────────────────────────────────────────
+check_gpu() {
+    command -v nvidia-smi >/dev/null 2>&1 || { bad "找不到 nvidia-smi"; return 1; }
+    local names found=""
+    names=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)
+    [ -z "$names" ] && { bad "nvidia-smi 枚举不到 GPU"; return 1; }
+    while IFS= read -r nm; do
+        case "$nm" in *"$TARGET_NAME"*) found="$nm" ;; esac
+    done <<< "$names"
+    if [ -n "$found" ]; then ok "目标卡：$found"; return 0; fi
+    bad "没有名字含 \"$TARGET_NAME\" 的 GPU"
+    echo "$names" | sed 's/^/      /'
+    [ "${P104_ALLOW_ANY:-0}" = "1" ] && { warn "P104_ALLOW_ANY=1，继续"; return 0; }
+    return 1
+}
+
+mod_loaded() { lsmod | grep -q "^$MOD "; }
+
+# ── 当前状态 ─────────────────────────────────────────────────────
+gpu_line() { nvidia-smi --query-gpu=pstate,clocks.sm,clocks.mem,power.draw \
+                 --format=csv,noheader 2>/dev/null | head -1; }
+
+# 判定当前处于哪一档。
+#   5005 态：mem >= 4000（此时 perfmon 停摆，pstate 恒 P0、功耗 ~69W）
+#   405 态 ：mem < 1000
+gpu_mode() {
+    local m
+    m=$(nvidia-smi --query-gpu=clocks.mem --format=csv,noheader,nounits 2>/dev/null \
+        | head -1 | tr -d ' ')
+    [ -z "$m" ] && { echo "unknown"; return; }
+    if [ "$m" -ge 4000 ] 2>/dev/null; then echo "5005"; else echo "405"; fi
+}
+
+# 找一个可用的负载程序
+find_loader() {
+    local l
+    for l in "${P104_LOADER:-}" /home/union/p104-probe-clburn \
+             /data/labs/nvidia/analysis/clburn "$HERE/clburn"; do
+        [ -n "$l" ] && [ -x "$l" ] && { echo "$l"; return 0; }
+    done
+    return 1
+}
+
+# 跑一次负载（默认 4 秒，用于"促回落"）
+kick() {
+    local l; l=$(find_loader) || { nvidia-smi -q >/dev/null 2>&1; sleep 2; return 0; }
+    "$l" 4 triad >/dev/null 2>&1
+}
+
+# 跑一次足够的负载（用于制造 P8→P0 跃迁，让 changeseq 看到清掉的 flag）
+load_once() {
+    local secs=${1:-10} l
+    l=$(find_loader) || { nvidia-smi -q >/dev/null 2>&1; sleep 3; return 0; }
+    "$l" "$secs" triad >/dev/null 2>&1
+}
+
+# 等 GPU 真正回到空闲（P8 + MCLK 405）。
+# ⚠ 这是 on 成功的**先决条件**，不是可选优化：
+#   清掉 bit0 之后 GPU_IS_IDLE 失效 ⇒ pstate 常驻 P0 ⇒ 不再有 P-State 转换
+#   ⇒ 没有 changeseq ⇒ MCLK 永远不会被重新下发。卡在 P0/405 的死锁里出不来。
+#   实测：先回 P8 再清 flag，一次成功（252.3 GB/s）；
+#         已在 P0 时直接清 flag，怎么跑负载都是 405。
+wait_idle() {
+    local i=0
+    while [ $i -lt 20 ]; do
+        if [ "$(gpu_mode)" = "405" ] && \
+           nvidia-smi --query-gpu=pstate --format=csv,noheader 2>/dev/null | grep -q "^P8"; then
+            return 0
+        fi
+        sleep 1; i=$((i+1))
+    done
+    return 1
+}
+
+# ── on ───────────────────────────────────────────────────────────
+do_on() {
+    echo "── 检查 ──"
+    check_gpu || exit 1
+    [ -f "$KO" ] || { bad "找不到模块 $KO"; inf "先编译：cd $ARTDIR && make"; exit 1; }
+
+    if mod_loaded; then
+        ok "模块已加载，复用"
+    else
+        echo "── 加载模块 ──"
+        if ! insmod "$KO" 2>/tmp/.p104-ins.err; then
+            bad "insmod 失败"; sed 's/^/    /' /tmp/.p104-ins.err
+            rm -f /tmp/.p104-ins.err; exit 1
+        fi
+        local i=0
+        while [ ! -e "$SYS/override" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+        [ -e "$SYS/override" ] || { bad "sysfs 未就绪"; dmesg | tail -5 | sed 's/^/    /'; exit 1; }
+        ok "模块已加载"
+    fi
+
+    if [ "$(gpu_mode)" = "5005" ]; then
+        ok "已经是 5005，无需操作"
+        inf "$(gpu_line)"
+        return 0
+    fi
+
+    # ── 核心两步：回 P8 → 趁空闲清 flag → 立刻长负载 ─────────────
+    #
+    # 为什么必须这个顺序（实测总结）：
+    #   · 清 flag 后 GPU_IS_IDLE 失效 ⇒ 常驻 P0 ⇒ 不再有 P-State 跃迁
+    #     ⇒ 没有 changeseq ⇒ MCLK 不会被重新下发。
+    #   · 所以「清 flag 之后」再重试是徒劳的 —— 必须重新回到 P8 才有机会。
+    #   · 单次负载要给足时间：实测 12s 命中，4s 常来不及。
+    #
+    # 因此重试的最小单位是「回 P8 + 清 flag + 长负载」这一整轮。
+    local attempt max_try=${P104_RETRY:-4} dur=${P104_LOAD_SECS:-10}
+    attempt=0
+    while [ $attempt -lt "$max_try" ]; do
+        attempt=$((attempt+1))
+        [ $attempt -gt 1 ] && echo "── 第 $attempt 轮 ──"
+
+        # (a) 回 P8
+        echo 2 > "$SYS/override" 2>/dev/null      # 先置回 bit0，让 GPU_IS_IDLE 复活
+        if ! wait_idle; then
+            kick                                   # 卡住了就跑一次促它回落
+            if ! wait_idle; then
+                warn "无法回到 P8（$(gpu_line)），跳过本轮"
+                continue
+            fi
+        fi
+        ok "P8 就绪：$(gpu_line)"
+
+        # (b) 趁空闲清 flag
+        echo 0 > "$SYS/override" 2>/dev/null || { bad "写 override 失败"; exit 1; }
+
+        # (c) 立刻长负载，让那次 P8→P0 的 changeseq 看到清掉的 flag
+        load_once "$dur"
+
+        [ "$(gpu_mode)" = "5005" ] && break
+        warn "本轮未命中（$(gpu_line)）"
+    done
+
+    echo
+    echo "── 结果 ──"
+    inf "$(gpu_line)"
+    if [ "$(gpu_mode)" = "5005" ]; then
+        ok "MCLK=5005（已解锁）"
+        inf "注意：perfmon 停摆 ⇒ util 恒 0、pstate 恒 P0、空闲约 69W"
+        inf "用完记得：$SELF off"
+    else
+        bad "MCLK 仍未到 5005（试了 $attempt 轮）"
+        inf "这是 D-state 下的竞态，多试几次通常能中：$SELF on"
+        inf "或加长单次负载：P104_LOAD_SECS=15 $SELF on"
+    fi
+}
+
+# ── off：安全恢复 ────────────────────────────────────────────────
+do_off() {
+    echo "── 检查 ──"
+    check_gpu || exit 1
+    if ! mod_loaded; then
+        ok "模块未加载 —— 本来就是原生 405 行为"
+        inf "$(gpu_line)"
+        return 0
+    fi
+
+    # 幂等：已经是 405 就不要再去跑负载"触发 changeseq"了。
+    # （踩过：unload 里再调一次 off，本来已经 P8/405/8.7W 空闲，
+    #   却被 load_once 重新撑到 P0/33W，看起来像卸载失败。）
+    if [ "$(gpu_mode)" = "405" ]; then
+        ok "MCLK 已经是 405，无需切换"
+        inf "$(gpu_line)"
+        return 0
+    fi
+
+    echo "── 恢复 PERFMON_ENABLED ──"
+    # override=2 是专门为这件事加的：强制把 bit0 置回去。
+    # 不能只靠 rmmod —— __exit 里虽然也置位，但实测常常来不及生效。
+    if echo 2 > "$SYS/override" 2>/dev/null; then
+        ok "override=2（置回 bit0）"
+    else
+        bad "写 override 失败"; return 1
+    fi
+
+    # 置回 bit0 只是改了标志；MCLK 真要回 405 还得靠一次 changeseq。
+    # 而能制造 changeseq 的只有一次**真实的负载跃迁**（P0→P8 或 P8→P0）。
+    #
+    # ⚠ 这里的火候很难：踩过两种极端
+    #   ① 完全静置：bit0 置回了，但 GPU 常驻 P0/5005/69W 20 秒都不动
+    #      （因为 GPU_IS_IDLE 恢复后 RM 并不主动重算，它等下一次跃迁）
+    #   ② 在循环里反复跑负载：负载把 GPU 撑住，永远等不到降档
+    # 正确做法：**只跑一次短负载，然后纯静置等它自己降**。
+    echo "── 触发一次 changeseq ──"
+    load_once 5
+    echo "── 等待降档（静置，不再施加负载）──"
+    local i=0
+    while [ $i -lt 25 ]; do
+        [ "$(gpu_mode)" = "405" ] && break
+        sleep 1; i=$((i+1))
+        [ $((i % 5)) -eq 0 ] && inf "  ${i}s… $(gpu_line)"
+    done
+
+    echo
+    echo "── 结果 ──"
+    if [ "$(gpu_mode)" = "405" ]; then
+        sleep 3
+        inf "$(gpu_line)"
+        ok "已回到 405（原生功耗）"
+    else
+        warn "MCLK 仍高：$(gpu_line)"
+        inf "再多等一会，或跑一次负载触发 changeseq"
+        inf "⚠ 此时不要 rmmod，否则 GPU 会常驻高功耗"
+    fi
+}
+
+# ── unload：off + 卸载 ───────────────────────────────────────────
+do_unload() {
+    do_off
+    [ "$(gpu_mode)" = "405" ] || {
+        bad "未回到 405，拒绝卸载（否则 GPU 会常驻 P0/5005/70W）"
+        inf "先跑一次负载让它回落，再执行 $SELF unload"
+        exit 1
+    }
+    echo "── 卸载模块 ──"
+    if rmmod "$MOD" 2>/tmp/.p104-rm.err; then
+        ok "已卸载"
+    else
+        bad "rmmod 失败"; sed 's/^/    /' /tmp/.p104-rm.err
+        rm -f /tmp/.p104-rm.err; exit 1
+    fi
+    sleep 2
+    inf "$(gpu_line)"
+}
+
+# ── status ───────────────────────────────────────────────────────
+do_status() {
+    echo "════ P104 显存频率开关 ════"
+    echo
+    echo "── 组件 ──"
+    mod_loaded && ok "模块 $MOD 已加载" || bad "模块 $MOD 未加载"
+    if [ -e "$SYS/override" ]; then
+        local ov md
+        ov=$(cat "$SYS/override" 2>/dev/null)
+        md=$(cat "$SYS/mode" 2>/dev/null)
+        inf "mode=$md  override=$ov"
+        case "$ov" in
+            0)  inf "→ 强制取 max（bit0 已清，MCLK 应 5005）" ;;
+            2)  inf "→ 强制置回 bit0（应回 405）" ;;
+            -1) inf "→ 不干预（跟随 mode）" ;;
+        esac
+    fi
+
+    echo
+    echo "── GPU ──"
+    inf "$(gpu_line)"
+
+    echo
+    echo "── 判定 ──"
+    case "$(gpu_mode)" in
+        5005) ok "当前 5005（空闲也高功耗，util/pstate 读数不可信）" ;;
+        405)  ok "当前 405（原生功耗）" ;;
+        *)    warn "无法判定" ;;
+    esac
+    mod_loaded && inf "切换：$SELF off"  || inf "切换：$SELF on"
+}
+
+# ── main ─────────────────────────────────────────────────────────
+[ $# -eq 0 ] && set -- status
+
+case "$1" in
+on|start)   need_root "$@"; do_on ;;
+off|stop)   need_root "$@"; do_off ;;
+unload)     need_root "$@"; do_unload ;;
+status)     do_status ;;
+*)
+cat <<EOF
+用法: $SELF {on|off|status|unload}
+
+  on      切到 5005（清 PERFMON_ENABLED）
+  off     切回 405（置回 PERFMON_ENABLED，安全恢复）
+  unload  off 之后再卸载模块
+  status  当前状态
+
+无需写 sudo（脚本自己提权重入）。
+文件：
+  模块  $KO
+  sysfs $SYS
+
+⚠ on 状态下 perfmon 停摆 ⇒ utilization 恒 0、pstate 恒 P0、空闲约 69W。
+  这是「时钟锁定」的代价，也是为什么方案 A（regkey）同样避开不了。
+EOF
+exit 1 ;;
+esac

@@ -1,0 +1,42 @@
+# 版本元数据 —— 580.178.04
+# 机器可读；与 README.md 的实测记录保持一致
+
+version=580.178.04
+status=client-and-reserve-verified
+
+# 驱动与内核
+driver_version=580.178.04
+kernel_verified=6.12.116+deb13-amd64
+kernel_also_seen=6.12.113
+gpu=NVIDIA P104-100
+
+# ABI 指纹（make abi 的实际输出，已核对一致）
+abi_nvos64_bytes=48
+abi_nvos54_bytes=32
+abi_nvos80_params_bytes=56
+abi_nvos2080_params_bytes=4
+abi_reserve_params_bytes=1
+cmd_reserve_perfmon=0x20802093
+ioctl_rm_alloc=0xc030462b
+ioctl_rm_control=0xc020462a
+need_open_gpu_node=1
+alloc_parms_size_by_class=1
+
+# 验证进度
+verify_client=ok
+verify_reserve=ok
+verify_exclusive=ok
+# 极性翻转的三条路全部实测证伪（2026-11-13）：
+#   D  reserve perfmon : acquire 成功但 MCLK 不翻，且常驻 P0/1911/44W
+#   A' PM1 常驻        : nvidia-settings 报 assigned value 1，但读回仍 0、行为无变化（no-op）
+#   自然获得           : MCLK=5005 只在「负载停止后降档窗口(~2.5s)」与
+#                        「跨会话继承 max 极性的首轮负载」出现，不可持续
+# 结论：要持续 5005 只能走方案 A（MaxPerfWithPerfMon=0），已实测有效（带宽 278.6 GB/s）
+verify_polarity_flip=closed-nonviable   # 三条路证伪；正解 = 方案 A 的 regkey
+verified_date=2026-11-13
+verified_on=Portable 192.168.1.43
+
+# 与其他版本的差异
+#   510 源码头文件 NVOS64 = 40 字节（无 paramsSize/flags）
+#   580 实测           = 48 字节（含 paramsSize/flags）← 本版本
+notes=NVOS64 多了 paramsSize/flags；alloc device 前必须先 open /dev/nvidia0

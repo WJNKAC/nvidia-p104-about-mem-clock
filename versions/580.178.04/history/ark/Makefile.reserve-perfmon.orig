@@ -1,0 +1,25 @@
+# 版本内构建：产物落在 ./bin/
+CC      ?= cc
+CFLAGS  ?= -O2 -Wall -Wextra -std=gnu11
+TARGET   = bin/p104-set-mem-clock
+SRC      = src/p104-set-mem-clock.c
+
+all: $(TARGET)
+
+$(TARGET): $(SRC) src/abi.h
+	@mkdir -p bin
+	$(CC) $(CFLAGS) -Isrc -o $@ $(SRC)
+	@echo
+	@echo "构建完成: $(CURDIR)/$(TARGET)"
+	@./$(TARGET) --help 2>/dev/null | head -1 || true
+
+# 打印 ABI 指纹 —— 部署前必看，确认这份二进制对应哪套常量
+abi: src/sizes.c $(SRC) src/abi.h
+	@mkdir -p bin
+	$(CC) -O0 -w -Isrc -o bin/sizes src/sizes.c
+	@./bin/sizes
+
+clean:
+	rm -f bin/p104-set-mem-clock bin/sizes
+
+.PHONY: all abi clean

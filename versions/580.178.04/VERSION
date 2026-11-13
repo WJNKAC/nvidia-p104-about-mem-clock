@@ -1,0 +1,72 @@
+# 版本元数据 —— 580.178.04
+# 机器可读；与 README.md 的实测记录保持一致
+
+version=580.178.04
+status=memclock-switch-usable
+
+# 驱动与内核
+driver_version=580.178.04
+kernel_verified=6.12.116+deb13-amd64
+kernel_also_seen=6.12.113
+gpu=NVIDIA P104-100
+gpu_device_id=0x1B8710DE
+gpu_part=1B87-100-A1
+
+# ── 本版本交付物 ──────────────────────────────────────────────
+# 主入口：main/p104-switch.sh   {on|off|status|deploy|unload}
+feature_manual_switch=ok
+feature_auto_switch=not-implemented     # 判据自毁，见下
+
+# ── 关键常量（580 二进制实测，报告 237/239）──────────────────
+perf_flags_offset=0x8e100               # pPerf->perfmon flags
+perf_flag_enabled=0x1                   # bit0；清掉即解除时钟锁定
+perf_flag_needed=0x4                    # bit2；NEEDED_BY_CLIENT
+perf_cond_mask=0x5                      # 各守卫检查的掩码
+perf_extra_bit=0x80                     # bit7，多数守卫还要求它
+mclk_idx=2                              # clocks[] 里 MCLK 下标（stride 0x24）
+target_khz=5005000
+
+# ABI 指纹（reserve perfmon 工具用；手动切换不依赖这些）
+abi_nvos64_bytes=48
+abi_nvos54_bytes=32
+abi_nvos80_params_bytes=56
+abi_nvos2080_params_bytes=4
+abi_reserve_params_bytes=1
+cmd_reserve_perfmon=0x20802093
+ioctl_rm_alloc=0xc030462b
+ioctl_rm_control=0xc020462a
+need_open_gpu_node=1
+alloc_parms_size_by_class=1
+
+# ── 实测结论 ────────────────────────────────────────────────
+# 405 的成因（四轮才定案，前三个结论都已推翻）：
+#   ①  早期     : 极性取 min（PolarityGet 条件②）        → 证伪：改极性 GPC 变、MCLK 不变
+#   ②  报告 233 : MCLK range 被压成单点 [405,405]         → 不完整：塌缩值会变
+#   ③  报告 236 : 硬件锁存竞态，约 25% 概率                → 证伪：A/B 两组 range 完全相同
+#   ④  报告 237 : PERFMON_ENABLED=1 期间的时钟锁定（当前） → 成立
+#
+# A/B 判决（唯一变量 = bit0，两组 range 与 curValueToSet 完全相同）：
+#   bit0=1 → 405 MHz /  19.3 GB/s
+#   bit0=0 → 5005 MHz / 254.5 GB/s
+# ⇒ 改 curValueToSet 是无效方向。
+#
+# 硬件零审查：写 3000000（3 GHz）→ 硬件真跑 2999 MHz，无电压/时序校验。
+# 一行 MaxPerfWithPerfMon=0 能生效，正是因为它只做了"清 bit0"这一件事。
+
+# ── 自动切换为什么没做 ──────────────────────────────────────
+# 清 bit0 后 perfmon 停摆 ⇒ utilization 恒 0（_nv051004rm 的数据源没了，
+# 报告 239 已定位到该函数）⇒ pstate 恒 P0 ⇒ GPU_IS_IDLE 失效。
+# 任何基于 util/pstate/功耗的运行时判据都会自毁。
+# 不是"闸门没找到"，是"找不到不自毁的判据"。
+
+# ── 已验证（2026-11-13，Portable）────────────────────────────
+verify_deploy=ok
+verify_on=ok                            # 5005 / 249.6 GB/s
+verify_off=ok                           # 405 / 7.6 W，5 秒内
+verify_off_idempotent=ok
+verify_unload=ok
+verify_status=ok
+verify_note=判频率只信 clburn 带宽；clocks.mem 会谎报
+
+verified_date=2026-11-13
+notes=bit0 偏移 0x8e100 是 580 的；换驱动版本必须重新定位
